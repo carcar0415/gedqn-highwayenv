@@ -1,0 +1,8 @@
+torch
+numpy
+gym
+highway-env
+stable-baselines3
+opencv-python
+PyYAML
+matplotlib

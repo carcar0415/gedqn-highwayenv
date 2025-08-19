@@ -1,0 +1,1069 @@
+env
+	custom_merge.py
+# env/custom_merge_env.py
+# 自定义合流区环境，集成CLMHA冲突预测 + 多智能体动作控制支持 + 自定义奖励函数 + 加速度接口支持 + 主路结构配置（兼容无 RoadNetwork） + 随机车辆扰动增强
+
+import gymnasium as gym
+import numpy as np
+from highway_env.envs.merge_env import MergeEnv
+from model.clmha_model import CLMHA
+import torch
+from utils.risk_utils import extract_state_sequence
+from utils.reward_utils import compute_custom_reward
+from utils.risk_utils import extract_structured_obs
+from highway_env.road.road import Road
+from highway_env.road.lane import StraightLane
+from collections import defaultdict
+import math
+import random
+
+LANE_WIDTH = 4
+
+class CustomMergeEnv(MergeEnv):
+    def __init__(self):
+        super().__init__(render_mode="human")
+
+        self.config.update({
+            "controlled_vehicles": 1,
+            "action": {
+                "type": "MultiAgentAction",
+                "action_config": {
+                    "type": "DiscreteMetaAction"
+                }
+            },
+            "acceleration_range": [-3.0, 3.0],
+            "max_acceleration": 3.0,
+            "max_deceleration": 3.0,
+            "policy_frequency": 10,
+            "road_length": 500,
+            "merge_length": 150,
+            "merge_start": 400,
+            "lanes_count": 4,
+            "merge_lanes": 1,
+            "idm_speed_factor": 1.1,
+            "vehicles_type": "IDM",
+            "random_seed": None
+        })
+        self.configure(self.config)
+
+        self.clmha = CLMHA(input_dim=8, hidden_dim=64)
+        self.clmha.load_state_dict(torch.load("model/clmha_model.pth", map_location="cpu"))
+        self.clmha.eval()
+
+        self.seq_len = 5
+        self.history = []
+        self._last_speeds = {}
+
+def make_road(self):
+    network = defaultdict(list)
+    road = Road(network=network, np_random=self.np_random, record_history=self.config["show_trajectories"])
+
+    lanes = self.config.get("lanes_count", 4)
+    merge_lanes = self.config.get("merge_lanes", 1)
+    length = self.config.get("road_length", 500)
+    merge_length = self.config.get("merge_length", 150)
+    merge_start = self.config.get("merge_start", 400)
+
+    for lane_id in range(3):
+        road.network["a", "b"].append(
+            StraightLane([0, lane_id * LANE_WIDTH], [length, lane_id * LANE_WIDTH],
+                         line_types=["continuous", "striped"])
+        )
+
+    for m in range(merge_lanes):
+        start = [merge_start, -LANE_WIDTH]
+        end = [length, 0.5 * LANE_WIDTH]
+        road.network["c", "b"].append(
+            StraightLane(start, end, line_types=["none", "striped"])
+        )
+
+    # ✅ 兼容 graph 方法
+    def get_closest_lane_index(position, heading=0):
+        min_dist = float('inf')
+        closest_lane = None
+        for (start, end), lanes in road.network.items():
+            for idx, lane in enumerate(lanes):
+                dist = np.linalg.norm(position - lane.position(0, 0))
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_lane = (start, end, idx)
+        return closest_lane
+
+    road.graph = {"a": ["b"], "c": ["b"]}
+    road.network.get_closest_lane_index = get_closest_lane_index  # ✅ 添加方法
+
+    self.road = road
+
+
+    def _make_vehicles(self, n_vehicles=10):
+        from highway_env.vehicle.behavior import IDMVehicle
+        from highway_env.vehicle.controller import ControlledVehicle
+        self.road.vehicles = []
+
+        for _ in range(n_vehicles):
+            entry = np.random.choice(["a", "c"])
+            lane_id = ("a", "b", np.random.randint(4)) if entry == "a" else ("c", "b", 0)
+            lane = self.road.network[lane_id[0], lane_id[1]][lane_id[2]]
+            position = lane.position(np.random.uniform(0, lane.length), 50)
+            vehicle = IDMVehicle(self.road, position, np.random.uniform(20, 30))
+            vehicle.speed *= np.random.uniform(0.85, 1.05)
+            self.road.vehicles.append(vehicle)
+
+        # for i in range(self.config["controlled_vehicles"]):
+        #     entry = np.random.choice(["a", "c"])
+        #     lane_id = ("a", "b", np.random.randint(3)) if entry == "a" else ("c", "b", 0)
+        #     lane = self.road.network[lane_id[0], lane_id[1]][lane_id[2]]
+        #     position = lane.position(np.random.uniform(0, lane.length), 0)
+        #     vehicle = ControlledVehicle(self.road, position, np.random.uniform(22, 32))
+        #     self.road.vehicles.insert(0, vehicle)
+        for i in range(self.config["controlled_vehicles"]):
+            entry = np.random.choice(["a", "c"]) 
+            lane_id = ("a", "b", np.random.randint(3)) if entry == "a" else ("c", "b", 0)
+            lane = self.road.network[lane_id[0], lane_id[1]][lane_id[2]]
+            position = lane.position(np.random.uniform(0, lane.length), 0)
+            vehicle = ControlledVehicle(self.road, position, np.random.uniform(22, 32))
+            self.road.vehicles.insert(0, vehicle)
+
+
+    def reset(self, seed=None, **kwargs):
+        if seed is None:
+            seed = random.randint(0, 99999)
+        self.np_random, _ = gym.utils.seeding.np_random(seed)
+
+        self.make_road()
+        self._make_vehicles()
+        obs, _ = super().reset(config={"vehicles_count": 0}, **kwargs)
+        self.history = []
+        self._last_speeds = {id(v): v.speed for v in self.road.vehicles}
+        return obs
+
+    def step(self, actions):
+        obs, rewards, terminated, truncated, info = super().step(actions)
+        self.history.append(obs)
+        done = terminated or truncated
+
+        if len(self.history) >= self.seq_len:
+            input_seq = extract_state_sequence(self.history[-self.seq_len:])
+            with torch.no_grad():
+                risk_scores = self.clmha(input_seq).squeeze(-1).numpy()
+        else:
+            risk_scores = np.zeros((len(obs),))
+
+        processed_obs = extract_structured_obs(self.road, self.config["controlled_vehicles"], risk_scores)
+
+        for v in self.road.vehicles:
+            last_v = self._last_speeds.get(id(v), v.speed)
+            current_v = v.speed
+            v.acc_value = (current_v - last_v) / self.config.get("policy_frequency", 10)
+            self._last_speeds[id(v)] = current_v
+
+        rewards = []
+        for i, v in enumerate(self.road.vehicles[:self.config["controlled_vehicles"]]):
+            r = compute_custom_reward(info, v, self.config)
+            rewards.append(r)
+
+        info["risk"] = float(np.mean(risk_scores))
+
+        return processed_obs, rewards, terminated, truncated, info
+model
+	clmha_model.py
+# model/clmha_model.py
+# CLMHA 模型：CNN + LSTM + 多头注意力，用于预测车辆冲突风险等级
+
+import torch
+import torch.nn as nn
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+
+    def forward(self, x):  # x: [B, T, H]
+        attn_output, _ = self.attn(x, x, x)
+        return attn_output
+
+class CLMHA(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(CLMHA, self).__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv1d(in_channels=input_dim, out_channels=32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+        self.lstm = nn.LSTM(input_size=64, hidden_size=hidden_dim, batch_first=True)
+        self.attn = MultiHeadAttention(hidden_dim, num_heads=4)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):  # 输入 x: [B, T, F]
+        if x.shape[-1] < 8:
+            pad_dim = 8 - x.shape[-1]
+            x = torch.nn.functional.pad(x, (0, pad_dim))  # 在最后一维填充0
+            # print(f"⚠️ 自动补齐状态维度：新x.shape = {x.shape}")
+
+        B, T, F = x.size()
+        x = x.reshape(B * T, F).unsqueeze(-1)       # ✅ [B*T, F, 1] → 通道数 F=input_dim
+        cnn_out = self.cnn(x).squeeze(-1)           # ✅ [B*T, 64]
+        cnn_out = cnn_out.reshape(B, T, -1)         # ✅ [B, T, 64]
+        lstm_out, _ = self.lstm(cnn_out)            # ✅ [B, T, H]
+        attn_out = self.attn(lstm_out)              # ✅ [B, T, H]
+        output = self.fc(attn_out[:, -1, :])        # ✅ [B, 1]
+        return output
+
+	dqn_agent.py
+# GE-DQN 智能体类（融合博弈策略 + DQN结构）
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import numpy as np
+from collections import deque
+
+class QNet(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(QNet, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128), nn.ReLU(),
+            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(128, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class DQNAgent:
+    def __init__(self, config):
+        # 检查配置参数
+        required_keys = ["learning_rate", "gamma", "state_dim", "batch_size", "train_freq", "target_update_interval"]
+        for key in required_keys:
+            if key not in config:
+                raise ValueError(f"配置缺少必要参数: {key}")
+
+        self.lr = config["learning_rate"]
+        self.gamma = config["gamma"]
+        self.action_space = [0, 1, 2, 3, 4]
+
+        self.state_dim = config["state_dim"]
+        self.action_dim = len(self.action_space)
+
+        self.net = QNet(self.state_dim, self.action_dim)
+        self.target_net = QNet(self.state_dim, self.action_dim)
+        self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr)
+
+        self.memory = deque(maxlen=10000)
+        self.batch_size = config["batch_size"]
+        self.train_freq = config["train_freq"]
+        self.step_counter = 0
+        self.target_update_interval = config["target_update_interval"]
+
+    def choose_action(self, state, nash_action=None, epsilon=0.1):
+        """选择动作，支持 ε-贪婪策略和纳什动作融合"""
+        self.net.eval()
+        state = torch.FloatTensor(state).unsqueeze(0)
+
+        with torch.no_grad():
+            if np.random.rand() < epsilon:
+                # ε-贪婪探索：随机选动作
+                dqn_action = np.random.choice(self.action_space)
+            else:
+                # 正常 Q 网络决策
+                q_vals = self.net(state)
+                dqn_action = q_vals.argmax().item()
+
+        # 融合纳什动作（如提供）
+        if nash_action is not None:
+            final_action = int(0.5 * dqn_action + 0.5 * nash_action)
+        else:
+            final_action = dqn_action
+
+        return int(final_action)
+
+    def replay_buffer_add(self, s, a, r, s_, done):
+        """将经验存入回放缓冲区"""
+        self.memory.append((s, a, r, s_, done))
+
+    def _pad_state(self, state, target_dim):
+        """自动补齐状态维度"""
+        if state.shape[1] != target_dim:
+            pad = target_dim - state.shape[1]
+            state = np.pad(state, ((0, 0), (0, pad)), mode='constant')
+        return state
+
+    def train_step(self):
+        """执行一次训练步骤"""
+        if len(self.memory) < self.batch_size:
+            return
+
+        batch = random.sample(self.memory, self.batch_size)
+        s, a, r, s_, d = zip(*batch)
+
+        # 使用 numpy.array 加速转换
+        s = np.array(s)
+        s_ = np.array(s_)
+
+        # 自动修复错误状态维度
+        s = self._pad_state(s, self.state_dim)
+        s_ = self._pad_state(s_, self.state_dim)
+
+        # 转为 Tensor
+        s = torch.FloatTensor(s)
+        s_ = torch.FloatTensor(s_)
+        a = torch.LongTensor(a).unsqueeze(1)
+        r = torch.FloatTensor(r).unsqueeze(1)
+        d = torch.FloatTensor(d).unsqueeze(1)
+
+        # Q-Learning 更新
+        q_eval = self.net(s).gather(1, a)
+        with torch.no_grad():
+            q_next = self.target_net(s_).max(1)[0].unsqueeze(1)
+            q_target = r + self.gamma * (1 - d) * q_next
+
+        loss = nn.MSELoss()(q_eval, q_target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # 更新目标网络
+        self.step_counter += 1
+        if self.step_counter % self.target_update_interval == 0:
+            self.target_net.load_state_dict(self.net.state_dict())
+
+	dqn_agent.py
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import numpy as np
+from collections import deque
+
+class QNet(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(QNet, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128), nn.ReLU(),
+            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(128, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class DQNAgent:
+    """
+    GE-DQN 智能体类（融合博弈策略 + DQN结构），支持软更新、梯度裁剪、ε-贪婪探索。
+    """
+    def __init__(self, config):
+        # 检查配置参数
+        required_keys = ["learning_rate", "gamma", "state_dim", 
+                         "batch_size", "train_freq", "target_update_interval"]
+        for key in required_keys:
+            if key not in config:
+                raise ValueError(f"配置缺少必要参数: {key}")
+
+        self.lr = config["learning_rate"]
+        self.gamma = config["gamma"]
+        self.action_space = [0, 1, 2, 3, 4]
+
+        self.state_dim = config["state_dim"]
+        self.action_dim = len(self.action_space)
+
+        # Q 网络与目标网络
+        self.net = QNet(self.state_dim, self.action_dim)
+        self.target_net = QNet(self.state_dim, self.action_dim)
+        self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr)
+
+        # 经验回放缓存
+        self.memory = deque(maxlen=config.get("memory_size", 10000))
+        self.batch_size = config["batch_size"]
+        self.train_freq = config["train_freq"]
+        self.step_counter = 0
+        self.target_update_interval = config["target_update_interval"]
+
+        # 软更新系数 τ
+        self.tau = config.get("tau", 0.005)
+
+    def choose_action(self, state, nash_action=None, epsilon=0.1):
+        """选择动作，支持 ε-贪婪策略和纳什动作融合"""
+        self.net.eval()
+        state = torch.FloatTensor(state).unsqueeze(0)
+
+        with torch.no_grad():
+            if np.random.rand() < epsilon:
+                dqn_action = np.random.choice(self.action_space)
+            else:
+                q_vals = self.net(state)
+                dqn_action = q_vals.argmax().item()
+
+        # 融合纳什动作（如提供）
+        if nash_action is not None:
+            final_action = int(0.5 * dqn_action + 0.5 * nash_action)
+        else:
+            final_action = dqn_action
+
+        return int(final_action)
+
+    def replay_buffer_add(self, s, a, r, s_, done):
+        """将经验存入回放缓冲区"""
+        self.memory.append((s, a, r, s_, done))
+
+    def _pad_state(self, state, target_dim):
+        """自动补齐状态维度"""
+        if state.shape[1] != target_dim:
+            pad = target_dim - state.shape[1]
+            state = np.pad(state, ((0, 0), (0, pad)), mode='constant')
+        return state
+
+    def train_step(self):
+        """执行一次训练步骤，返回当前 TD loss"""
+        if len(self.memory) < self.batch_size:
+            return None
+
+        batch = random.sample(self.memory, self.batch_size)
+        s, a, r, s_, d = zip(*batch)
+
+        # 转为 numpy 加速转换
+        s = np.array(s)
+        s_ = np.array(s_)
+
+        # 自动修复状态维度
+        s = self._pad_state(s, self.state_dim)
+        s_ = self._pad_state(s_, self.state_dim)
+
+        # 转为 Tensor
+        s = torch.FloatTensor(s)
+        s_ = torch.FloatTensor(s_)
+        a = torch.LongTensor(a).unsqueeze(1)
+        r = torch.FloatTensor(r).unsqueeze(1)
+        d = torch.FloatTensor(d).unsqueeze(1)
+
+        # Q-Learning 更新
+        q_eval = self.net(s).gather(1, a)
+        with torch.no_grad():
+            q_next = self.target_net(s_).max(1)[0].unsqueeze(1)
+            q_target = r + self.gamma * (1 - d) * q_next
+
+        loss = nn.MSELoss()(q_eval, q_target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        # 梯度裁剪，防止梯度爆炸
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
+        # 软更新目标网络 θ_target ← τ θ_online + (1-τ) θ_target
+        for p, p_targ in zip(self.net.parameters(), self.target_net.parameters()):
+            p_targ.data.mul_(1.0 - self.tau)
+            p_targ.data.add_(self.tau * p.data)
+
+        self.step_counter += 1
+        return loss.item()
+utils
+	game_utils
+# utils/game_utils.py
+# 纳什均衡近似求解（Best Response）
+
+import numpy as np
+import torch
+
+def compute_nash_action(agents, state_list):
+    actions = []
+    for i, agent in enumerate(agents):
+        # print(f"👉 state_list[{i}].shape = {np.array(state_list[i]).shape}")  # ← 添加这行打印
+        
+        best_q = -np.inf
+        best_a = 0
+        for a in agent.action_space:
+            state_array = np.array(state_list[i]).flatten()
+            state_tensor = torch.FloatTensor(state_array).unsqueeze(0)
+            # print(f"👉 送入DQN的 shape: {state_tensor.shape}")
+
+            q_values = agent.net(state_tensor).detach().numpy().squeeze()
+            if q_values[a] > best_q:
+                best_q = q_values[a]
+                best_a = a
+        actions.append(best_a)
+    return actions
+
+	reward_utils.py
+# utils/reward_utils.py
+import numpy as np
+import math
+from typing import Dict, Any
+
+# === 全局常量 ===
+EPSILON = 1e-5  # 避免除零
+DEFAULT_CONFIG = {
+    "v_max": 20,
+    "a_comf": 1.0,
+    "s_safe": 5,
+    "lambda_I": 0.30,
+    "lambda_v": 0.30,
+    "lambda_a": 0.30,
+    "lambda_d": 0.10,
+    "T_min": 1.0,
+    "T_max": 5.0,
+}
+
+def compute_custom_reward(info: Dict[str, Any], vehicle: Any, config: Dict[str, Any]) -> float:
+    """
+    计算自定义奖励函数。
+
+    参数:
+        info (dict): 环境信息字典，例如碰撞、变道等事件。
+        vehicle (object): 车辆对象，包含速度、加速度等属性。
+        config (dict): 配置字典，包含奖励函数的参数。
+
+    返回:
+        float: 计算得到的奖励值。
+    """
+    # === 合并默认配置 ===
+    config = {**DEFAULT_CONFIG, **config}
+
+    # === 基本状态 ===
+    v = getattr(vehicle, "speed", 0.0)
+    v_T = getattr(vehicle, "target_speed", 15.0)
+    v_M = config["v_max"]
+    a = getattr(vehicle, "acc_value", 1.5)
+    a_comf = config["a_comf"]
+    s_CG = getattr(vehicle, "gap", 2.0)
+    s_safe = config["s_safe"]
+
+    # === 计算 I_T (基于 TTC + PET) ===
+    I_T = _compute_conflict_index(v, v_T, s_CG, config["T_min"], config["T_max"])
+
+    # === 权重参数 ===
+    lambda_I = config["lambda_I"]
+    lambda_v = config["lambda_v"]
+    lambda_a = config["lambda_a"]
+    lambda_d = config["lambda_d"]
+
+    # === 偏置项（惩罚/奖励）===
+    w_1 = -1000 if info.get("crash", False) else 0               # 碰撞惩罚
+    w_2 = -10 if info.get("lane_change", False) else 0           # 变道惩罚
+    w_3 = -5 if info.get("out_of_road", False) else 0            # 出界惩罚
+
+    # === 核心奖励项 ===
+    R_I = 1 / (I_T * abs(a) + EPSILON)        # 冲突-加速度平衡
+    R_v = 1 - abs((v - v_T) / v_M)            # 跟车速度匹配
+    R_a = math.exp(-abs(a) / a_comf)          # 舒适加速度
+    R_d = s_CG / (s_safe + EPSILON)           # 安全距离
+
+    # === 其他惩罚项 ===
+    penalty_slow_front = -1 if v_T < 8 else 0      # 前车过慢惩罚
+    penalty_gap_small = -2 if s_CG < s_safe else 0 # 距离过近惩罚
+
+    # === 加权奖励函数 ===
+    reward = (
+        lambda_I * R_I +
+        lambda_v * R_v +
+        lambda_a * R_a +
+        lambda_d * R_d +
+        w_1 + w_2 + w_3 +
+        penalty_slow_front + penalty_gap_small
+    )
+
+    return reward
+
+def _compute_conflict_index(v: float, v_T: float, s_CG: float, T_min: float, T_max: float) -> float:
+    """
+    计算冲突风险指数 I_T。
+
+    参数:
+        v (float): 当前速度。
+        v_T (float): 目标速度。
+        s_CG (float): 当前车距。
+        T_min (float): 最小时间阈值。
+        T_max (float): 最大时间阈值。
+
+    返回:
+        float: 冲突风险指数 I_T。
+    """
+    TTC = s_CG / (abs(v_T - v) + EPSILON) if abs(v_T - v) > EPSILON else float('inf')
+    PET = (s_CG / (v + EPSILON)) - (s_CG / (v_T + EPSILON)) if v_T > EPSILON else float('inf')
+    omega_1, omega_2 = 0.5, 0.5  # 权重
+    T = omega_1 * TTC + omega_2 * PET
+
+    if T < T_min:
+        return 1.0
+    elif T > T_max:
+        return 0.0
+    else:
+        return 1 - (T - T_min) / (T_max - T_min)
+	
+	risk_utils.py
+# utils/risk_utils.py
+# 包含冲突指标计算（TTC/PET）与状态序列预处理函数 + 支持周围车辆信息提取
+
+import numpy as np
+import torch
+
+def extract_state_sequence(history):
+    state_seq = np.array(history)  # shape: [T, N, F]
+    state_seq = np.transpose(state_seq, (1, 0, 2))  # 转为 [N, T, F]
+    return torch.FloatTensor(state_seq)  # 输出：每辆车的状态序列，适合送入 CLMHA
+
+def preprocess_obs(obs_list, expected_num=3):
+    processed = []
+    for i in range(expected_num):
+        if i >= len(obs_list) or obs_list[i] is None or obs_list[i] == []:
+            processed.append(np.zeros(40))
+            continue
+
+        obs_arr = np.array(obs_list[i])
+
+        if obs_arr.ndim == 2:
+            flat = obs_arr.flatten()
+        elif obs_arr.ndim == 1:
+            flat = obs_arr
+        else:
+            processed.append(np.zeros(40))
+            continue
+
+        if flat.shape[0] < 40:
+            flat = np.pad(flat, (0, 40 - flat.shape[0]))
+        elif flat.shape[0] > 40:
+            flat = flat[:40]
+
+        processed.append(flat)
+    return processed
+
+def extract_structured_obs(road, expected_num, risk_scores):
+    structured = []
+
+    if len(risk_scores) < expected_num:
+        risk_scores = list(risk_scores) + [0] * (expected_num - len(risk_scores))
+
+    for i in range(expected_num):
+        if i >= len(road.vehicles):
+            structured.append(np.zeros(40))
+            continue
+
+        ego = road.vehicles[i]
+        ego_obs = [
+            ego.position[0], ego.position[1], ego.speed,
+            ego.heading, ego.lane_index[2] if ego.lane_index else -1,
+            risk_scores[i], ego.target_speed, ego.acc_value if hasattr(ego, "acc_value") else 0
+        ]
+
+        nearby = sorted(
+            [v for j, v in enumerate(road.vehicles) if j != i],
+            key=lambda v: np.linalg.norm(v.position - ego.position)
+        )[:4]
+
+        for v in nearby:
+            rel_pos = v.position - ego.position
+            ego_obs += [rel_pos[0], rel_pos[1], v.speed,
+                        v.lane_index[2] if v.lane_index else -1,
+                        v.acc_value if hasattr(v, "acc_value") else 0,
+                        v.heading - ego.heading, np.linalg.norm(rel_pos)]
+
+        if len(ego_obs) < 40:
+            ego_obs += [0] * (40 - len(ego_obs))
+        elif len(ego_obs) > 40:
+            ego_obs = ego_obs[:40]
+
+        structured.append(np.array(ego_obs))
+
+    return structured
+	
+
+main_train.py
+# main_train.py (Modified with Epsilon Decay, Reward Scaling, Convergence Detection)
+
+# import logging
+# logging.basicConfig(level=logging.ERROR)
+
+from env.custom_merge_env import CustomMergeEnv
+from model.dqn_agent import DQNAgent
+from utils.risk_utils import extract_structured_obs
+from utils.game_utils import compute_nash_action
+from utils.reward_utils import _compute_conflict_index    # 用于计算冲突指数 I_T
+import yaml, os, numpy as np, torch, sys
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# —— 保存上一集的平均风险与平均成功换道次数（用于下一集输入）
+previous_avg_risk = 0.0
+previous_avg_lane_changes = 0.0
+
+# —— 收敛检测参数（可调整）
+# window_size: 每多少集检测一次收敛，eps_r: reward 标准差阈值，eps_l: loss 均值变化阈值
+window_size = 50
+eps_reward = 0.02
+eps_loss = 1e-3
+reward_history = []
+loss_history = []
+
+def check_convergence(rewards, losses, window, eps_r, eps_l):
+    if len(rewards) < 2 * window or len(losses) < 2 * window:
+        return False
+    recent_r = np.array(rewards[-window:])
+    if recent_r.std() > eps_r:
+        return False
+    l1 = np.array(losses[-window:])
+    l0 = np.array(losses[-2*window:-window])
+    return abs(l1.mean() - l0.mean()) < eps_l
+
+# 环境简单测试
+env = CustomMergeEnv()
+obs, _ = env.reset()
+print(len(env.road.vehicles), env.controlled_vehicles[0].position)
+_ = env.step((0,))
+
+# 屏蔽 highway-env 内部打印
+class NullWriter:
+    def write(self, arg):
+        pass
+
+sys.stdout = NullWriter()
+sys.stderr = NullWriter()
+
+# 确保结果目录存在
+os.makedirs("results", exist_ok=True)
+
+# 读取训练配置
+trick_cfg_path = "config.yaml"
+with open(trick_cfg_path, "r") as f:
+    config = yaml.safe_load(f)
+
+# 仿真每步时长 dt（默认 10 Hz）
+dt = 1.0 / config.get("simulation_frequency", 10)
+
+# ε-贪婪探索参数
+epsilon_start = 1.0
+epsilon_end = 0.05
+epsilon_decay_episodes = config["max_train_episodes"]
+
+# 重建环境与智能体
+env = CustomMergeEnv()
+agents = [DQNAgent(config) for _ in range(1)]
+
+# 用于存储每集指标
+avg_speeds, avg_accels, avg_gaps = [], [], []
+avg_risks, avg_lane_changes, episode_rewards = [], [], []
+
+for episode in range(config["max_train_episodes"]):
+    obs = env.reset()
+    done = False
+
+    # 初始化每车的 prev_speed
+    for v in env.road.vehicles:
+        v.prev_speed = v.speed
+
+    # 本集临时统计
+    speed_list, accel_list, gap_list, risk_list = [], [], [], []
+    lane_change_count = 0
+    episode_reward = 0
+    step_losses = []
+    step_idx = 0
+
+    # 计算当前 ε 值
+    epsilon = max(
+        epsilon_end,
+        epsilon_start - (episode / epsilon_decay_episodes) * (epsilon_start - epsilon_end)
+    )
+
+    while not done:
+        # —— 在本集第一步，将上一集的指标输入 risk_scores
+        if step_idx == 0:
+            init_input = previous_avg_risk + previous_avg_lane_changes
+            risk_scores = [init_input] * len(agents)
+        else:
+            risk_scores = [o[-1] if len(o) >= 8 else 0 for o in obs]
+
+        # 提取状态与动作
+        state = extract_structured_obs(
+            env.road, expected_num=len(agents), risk_scores=risk_scores
+        )
+        nash_actions = compute_nash_action(agents, state)
+        flat_actions = []
+        for i, agent in enumerate(agents):
+            a = agent.choose_action(state[i], nash_actions[i], epsilon)
+            flat_actions.append(int(a))
+
+        # 成功换道计数
+        ego = env.road.vehicles[0]
+        old_lane = ego.lane_index[2] if ego.lane_index else None
+
+        # 环境步进
+        next_obs, reward, terminated, truncated, info = env.step(tuple(flat_actions))
+        done = terminated or truncated
+
+        ego = env.road.vehicles[0]
+        new_lane = ego.lane_index[2] if ego.lane_index else None
+        if old_lane is not None and new_lane is not None and new_lane != old_lane:
+            lane_change_count += 1
+
+        # 记录速度、加速度、gap
+        for v in env.road.vehicles:
+            accel = (v.speed - v.prev_speed) / dt
+            accel_list.append(accel)
+            v.prev_speed = v.speed
+            speed_list.append(v.speed)
+            gap_list.append(getattr(v, "gap", 0))
+
+        # 记录冲突指数 I_T
+        ego = env.road.vehicles[0]
+        I_T = _compute_conflict_index(
+            ego.speed,
+            ego.target_speed,
+            getattr(ego, "gap", config.get("s_safe", 5)),
+            config.get("T_min", 1.0),
+            config.get("T_max", 5.0)
+        )
+        risk_list.append(I_T)
+
+        # 累计奖励 + 缩放
+        raw_r = sum(reward) if isinstance(reward, (list, tuple, np.ndarray)) else reward
+        scaled_r = np.tanh(raw_r / config.get("reward_scale", 1.0))
+        episode_reward += scaled_r
+
+        # 经验回放与训练
+        for i, agent in enumerate(agents):
+            s = np.array(state[i]).flatten()
+            s_ = (
+                np.array(state[i]).flatten()
+                if i >= len(next_obs)
+                else np.array(next_obs[i]).flatten()
+            )
+            agent.replay_buffer_add(s, flat_actions[i], scaled_r, s_, done)
+            loss = agent.train_step()
+            if loss is not None:
+                step_losses.append(loss)
+
+        obs = next_obs
+        step_idx += 1
+
+    # 本集结束后计算平均指标
+    avg_speeds.append(np.mean(speed_list))
+    avg_accels.append(np.mean(accel_list))
+    avg_gaps.append(np.mean(gap_list))
+    avg_risks.append(np.mean(risk_list))
+    avg_lane_changes.append(lane_change_count)
+    episode_rewards.append(episode_reward)
+
+    # 更新上一集指标
+    previous_avg_risk = avg_risks[-1]
+    previous_avg_lane_changes = avg_lane_changes[-1]
+
+    # 记录收敛检测历史
+    reward_history.append(episode_reward)
+    if step_losses:
+        loss_history.append(np.mean(step_losses))
+    else:
+        loss_history.append(np.nan)
+
+    # 打印训练进度
+    sys.stdout = sys.__stdout__
+    print(f"[Episode {episode+1}/{config['max_train_episodes']}] "
+          f"Reward: {episode_reward:.2f}  "
+          f"AvgRisk: {previous_avg_risk:.3f}  "
+          f"AvgLaneChanges: {previous_avg_lane_changes}  "
+          f"ε: {epsilon:.2f}" )
+    sys.stdout = NullWriter()
+
+    # 收敛检测
+    if (episode+1) % window_size == 0:
+        if check_convergence(reward_history, loss_history, window_size, eps_reward, eps_loss):
+            sys.stdout = sys.__stdout__
+            print(f"收敛检测通过，训练在 Episode {episode+1} 时提前结束。")
+            sys.stdout = NullWriter()
+            break
+
+# 保存模型
+sys.stdout = sys.__stdout__
+for i, agent in enumerate(agents):
+    torch.save(agent.net.state_dict(), f"results/dqn_agent_{i}.pth")
+print("✅ 模型已保存至 results/")
+
+# 导出所有指标到 CSV
+df = pd.DataFrame({
+    "episode": list(range(1, config["max_train_episodes"]+1)),
+    "avg_speed": avg_speeds,
+    "avg_accel": avg_accels,
+    "avg_gap": avg_gaps,
+    "avg_risk": avg_risks,
+    "avg_lane_change": avg_lane_changes,
+    "episode_reward": episode_rewards,
+})
+df.to_csv("results/training_metrics.csv", index=False)
+print("✅ 指标已保存至 results/training_metrics.csv")
+
+# —— 每 10 集聚合并绘制折线图 —— #
+window = 100
+
+def aggregate(data, w):
+    return [np.mean(data[i:i+w]) for i in range(0, len(data), w)]
+
+x_vals = list(range(window, len(avg_speeds) + 1, window))
+
+plots = [
+    (avg_speeds, "每100集平均速度趋势图",   "Speed (m/s)",         "results/agg_avg_speed_curve.png"),
+    (avg_accels, "每100集平均加速度趋势图", "Acceleration (m/s²)",  "results/agg_avg_accel_curve.png"),
+    (avg_gaps,   "每100集平均车距趋势图",   "Gap (m)",              "results/agg_avg_gap_curve.png"),
+    (avg_risks,  "每100集平均风险趋势图",   "Risk",                 "results/agg_avg_risk_curve.png"),
+    (avg_lane_changes, "每100集平均成功换道次数趋势图","Lane Changes",       "results/agg_avg_lane_change_curve.png"),
+    (episode_rewards,  "每100集平均奖励趋势图",   "Total Reward",         "results/agg_avg_reward_curve.png"),
+]
+
+for data, title, ylabel, fname in plots:
+    y = aggregate(data, window)
+    plt.figure()
+    plt.plot(x_vals, y, linestyle='-', marker='o', linewidth=1)
+    plt.title(title)
+    plt.xlabel("Episode")
+    plt.ylabel(ylabel)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(fname)
+    plt.close()
+
+print("✅ 每100集聚合图已保存至 results/（以 agg_ 开头）")
+
+main_test.py
+# main_test.py (Modified to plot metrics every 10 episodes, fixed syntax errors)
+from env.custom_merge_env import CustomMergeEnv
+from model.dqn_agent import DQNAgent
+from utils.risk_utils import extract_structured_obs
+from utils.reward_utils import _compute_conflict_index
+import yaml
+import numpy as np
+import torch
+from PIL import Image
+import os
+import matplotlib.pyplot as plt
+
+# ==== 配置加载 ====
+with open("config.yaml", "r") as f:
+    config = yaml.safe_load(f)
+
+os.makedirs("results", exist_ok=True)
+
+# ==== 测试参数 ====
+dt = 1.0 / config.get("simulation_frequency", 10)
+plot_interval = 10  # 每10个episode输出一次图
+max_episodes = config.get("max_test_episodes", 50)
+
+# ==== 初始化环境 ====
+env = CustomMergeEnv()
+env.spec = type("spec", (), {"id": "CustomMerge-v0"})()
+
+# ==== 加载模型 ====
+agents = [DQNAgent(config) for _ in range(1)]
+for i, agent in enumerate(agents):
+    model_path = f"results/dqn_agent_{i}.pth"
+    agent.net.load_state_dict(torch.load(model_path, map_location="cpu"))
+    agent.net.eval()
+print("✅ 模型已加载")
+
+# ==== 测试循环 ====
+for episode in range(1, max_episodes + 1):
+    # 重置环境，获取观测
+    obs, _ = env.reset()
+    done = False
+
+    # 初始化记录
+    speed_list, accel_list, risk_list = [], [], []
+    ego = env.road.vehicles[0]
+    prev_speed = ego.speed
+    frames = []
+    step = 0
+
+    while not done:
+        # 构造状态
+        risk_scores = [o[-1] if len(o) >= 8 else 0 for o in obs]
+        state = extract_structured_obs(env.road, expected_num=len(agents), risk_scores=risk_scores)
+
+        # 选择动作（纯 exploitation）
+        actions = [int(agent.choose_action(state[i], epsilon=0.0)) for i, agent in enumerate(agents)]
+
+        # 环境步进
+        next_obs, reward, terminated, truncated, info = env.step(tuple(actions))
+        done = terminated or truncated
+
+        # 累积车辆状态与指标
+        for v in env.road.vehicles:
+            speed_list.append(v.speed)
+            accel_list.append(getattr(v, 'acc_value', 0))
+            I_T = _compute_conflict_index(
+                v.speed,
+                v.target_speed,
+                getattr(v, 'gap', config.get('s_safe', 5)),
+                config.get('T_min', 1.0),
+                config.get('T_max', 5.0)
+            )
+            risk_list.append(I_T)
+
+        # 渲染 GIF 帧
+        frame = env.render()
+        if isinstance(frame, np.ndarray):
+            frames.append(Image.fromarray(frame))
+
+        obs = next_obs
+        step += 1
+
+    # 计算本集平均指标
+    avg_speed = np.mean(speed_list) if speed_list else 0
+    avg_accel = np.mean(accel_list) if accel_list else 0
+    avg_risk = np.mean(risk_list) if risk_list else 0
+    print(f"[Episode {episode}/{max_episodes}] 完成, steps={step}, "
+          f"AvgSpeed={avg_speed:.2f} m/s, "
+          f"AvgAccel={avg_accel:.2f} m/s², "
+          f"AvgRisk={avg_risk:.3f}")
+
+    # 每 plot_interval episodes 输出三张折线图
+    if episode % plot_interval == 0:
+        t = list(range(len(speed_list)))
+        # 速度曲线
+        plt.figure()
+        plt.plot(t, speed_list, '-o', markersize=3)
+        plt.title(f"Episode {episode} 速度随时间变化")
+        plt.xlabel("Step")
+        plt.ylabel("Speed (m/s)")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f"results/speed_episode_{episode}.png")
+        plt.close()
+
+        # 加速度曲线
+        plt.figure()
+        plt.plot(t, accel_list, '-o', markersize=3)
+        plt.title(f"Episode {episode} 加速度随时间变化")
+        plt.xlabel("Step")
+        plt.ylabel("Accel (m/s²)")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f"results/accel_episode_{episode}.png")
+        plt.close()
+
+        # 风险曲线
+        plt.figure()
+        plt.plot(t, risk_list, '-o', markersize=3)
+        plt.title(f"Episode {episode} Risk 随时间变化")
+        plt.xlabel("Step")
+        plt.ylabel("Risk")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f"results/risk_episode_{episode}.png")
+        plt.close()
+
+        print(f"✅ 已生成 Episode {episode} 的速度、加速度和风险曲线图")
+
+    # 保存 GIF
+    if frames:
+        gif_path = f"results/test_episode_{episode}.gif"
+        frames[0].save(
+            gif_path,
+            save_all=True,
+            append_images=frames[1:],
+            duration=100,
+            loop=0
+        )
+        print(f"✅ 保存 GIF: {gif_path}")
+
+print("测试完成。")

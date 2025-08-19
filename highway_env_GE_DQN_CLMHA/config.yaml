@@ -1,0 +1,43 @@
+# config.yaml
+# 训练参数
+max_train_episodes: 10000
+learning_rate: 0.0005
+gamma: 0.99
+batch_size: 128
+memory_size: 50000
+train_freq: 1
+target_update_interval: 100
+tau: 0.005  # 软更新系数
+use_priority: true  # 启用优先经验回放
+
+# 环境参数
+simulation_frequency: 10
+policy_frequency: 5
+vehicles_count: 10
+controlled_vehicles: 1
+
+# 动作空间参数
+action_lateral: true
+action_longitudinal: true
+continuous_actions: false
+
+# 奖励函数参数
+reward_scale: 2.0  # 奖励缩放
+v_max: 30
+a_comf: 2.0
+s_safe: 10
+lambda_I: 0.40
+lambda_v: 0.20
+lambda_a: 0.20
+lambda_d: 0.20
+T_min: 1.0
+T_max: 5.0
+
+# 状态表示
+state_dim: 45  # 扩展状态维度
+
+# 辅助训练功能
+save_best_model: true
+eval_episodes: 10
+eval_interval: 100
+
